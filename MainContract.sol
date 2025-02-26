@@ -509,3 +509,4 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
         collections[_id].quantityInStock = _newQuantity;
     }
 }
+// йцувайцацуацу
