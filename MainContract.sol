@@ -118,18 +118,14 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
     uint256 public idCounter = 1;
     //amount of market place commission (in %).
     uint256 public immutable commission = 5;
-    //nonce to generate unique codes
-    uint256 private nonce = 0;
     uint256 private constant MAX_NAME_LENGTH = 64;
     uint256 private constant MAX_SYMBOL_LENGTH = 8;
 
     /// @notice _id => CollectionInfo (name,symbol and more)
     mapping(uint256 => CollectionInfo) public collections;
-    /// @notice _user => user's codes
-    mapping(address => uint256) private amountOfCodes;
     /// @notice _user => promoCode
     //!!!change to mapping (address => mapping(uint (collection id) => bytes8[]))
-    mapping(address => bytes8[]) private uniqPromoForUser;
+    mapping(address => mapping (uint => bytes8[])) public uniqPromoForUser;
 
     /**
     * @dev Structure containing information about an NFT collection.
@@ -209,8 +205,6 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
     //                                                     -           Main Functionality           -
     //                                                     ------------------------------------------
 
-    //add batchBuy Function
-
     /**
     * @dev Allows a user to buy a specified quantity of NFTs from a collection.
     * @param _id The ID of the collection to buy from.
@@ -230,29 +224,68 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
         uint256 fundsForSeller = totalPrice - (totalPrice * commission) / 100;
         uint256 amountOfCommission = totalPrice - fundsForSeller;
 
-        // Generate promo code(-s) and push them for user.
-        for (uint256 i = 0; i < _quantity; i++) {
-            bytes8 promoCode = _generatePromoCode();
-            uniqPromoForUser[msg.sender].push(promoCode);
+        // Refund excess funds to the buyer (if any).
+        if (msg.value > totalPrice) {
+            payable(msg.sender).transfer(msg.value - totalPrice);
         }
-        // Increment quantity of codes for user.
-        amountOfCodes[msg.sender] += _quantity;
-
         // Update quantity in stock.
         _updateQuantity(_id, cQuantity - _quantity);
- 
+
+        // Generate promo code(-s)
+        _generatePromoCode(_quantity, msg.sender, _id);
+
         // Transfer funds for seller and comission for owner.
         payable(getOwnerByCollectionId(_id)).transfer(fundsForSeller);
         payable(owner()).transfer(amountOfCommission);
+        // Emit event.
+        address _collectionAddress = getAddressById(_id);
+        emit productPurchased(msg.sender, _collectionAddress, price, _quantity);
+    }
+    
+    /**
+     * @notice Allows a user to purchase multiple NFTs from different collections in a single transaction.
+     * @dev This function handles the purchase of NFTs, calculates the total price including commission,
+     *      transfers funds to the sellers, and refunds any excess funds to the buyer(if need).
+     * @param _ids An array of collection IDs representing the NFTs to be purchased.
+     * @param _quantities An array of quantities for each NFT to be purchased. Must correspond to the `_ids` array.
+     */
+    function batchBuy (uint256[] calldata _ids, uint256[] calldata _quantities) external payable nonReentrant {
+        require(_ids.length == _quantities.length, arraysMisMatch());
+        // Limitation of the number of products in a transaction
+        require(_ids.length <= 1000);
+        // Initialize the total price
+        uint totalPrice = 0;
+        for(uint i = 0; i < _ids.length; i++) {
+            require(collections[_ids[i]].collectionAddress != address(0), incorrectId());
+            require(_quantities[i] > 0, incorrectQuantity());
+            uint256 cQuantity = collections[_ids[i]].quantityInStock;
+            require(cQuantity >= _quantities[i], incorrectQuantity());
 
+            uint price = (collections[_ids[i]].price)  * _quantities[i];
+            totalPrice += price;
+
+            // Update the quantity in stock
+            _updateQuantity(_ids[i], cQuantity - _quantities[i]);
+            // Generate a promo code for the buyer
+            _generatePromoCode(_quantities[i], msg.sender, _ids[i]);
+
+            // Transfer of funds to the seller
+            payable(getOwnerByCollectionId(_ids[i])).transfer(price - price*commission /100);
+
+            // Emit an event for the product purchased
+            emit productPurchased(msg.sender, getAddressById(_ids[i]),  price, _quantities[i]);
+        }
+        require(msg.value >= totalPrice, notEnoughFunds());
+        uint256 fundsForSeller = totalPrice - (totalPrice * commission) / 100;
+        uint amountOfCommission = totalPrice - fundsForSeller;
+        
         // Refund excess funds to the buyer (if any).
         if (msg.value > totalPrice) {
             payable(msg.sender).transfer(msg.value - totalPrice);
         }
 
-        // Emit event.
-        address _collectionAddress = getAddressById(_id);
-        emit productPurchased(msg.sender, _collectionAddress, price, _quantity);
+        // Transfer commission to the contract owner
+        payable(owner()).transfer(amountOfCommission);
     }
 
     /**
@@ -341,14 +374,13 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
             incorrectCollectionAddress()
         );
         // Check if promo code is valud.
-        require(_isPromoValid(_promoCode) == true, invalidPromoCode());
+        require(_isPromoValid(_promoCode, _id) == true, invalidPromoCode());
 
         // Mint the NFT.
         collection.mint(msg.sender);
 
         // Delete promo code for user.
-        _deletePromoCode(msg.sender, _promoCode);
-        amountOfCodes[msg.sender] -= 1;
+        _deletePromoCode(msg.sender, _promoCode, _id);
 
         // Emit event.
         emit promoCodeSuccessfullyUsed(msg.sender, _collectionAddress);
@@ -395,18 +427,19 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
     * @param _user The address of the user.
     * @return The promo code.
     */
-    function getPromo(uint256 _indexOfPromo, address _user)
+    function getPromo(uint256 _indexOfPromo, address _user, uint _id)
         public
         view
         onlyOwner
         returns (bytes8)
     {
         require(_user != address(0), incorrectAddress());
+        require(collections[_id].collectionAddress != address(0),collectionNotFound());
         require(
-            uniqPromoForUser[_user][_indexOfPromo] != bytes8(0),
+            _indexOfPromo < uniqPromoForUser[_user][_id].length,
             incorrectIndex()
         );
-        return (uniqPromoForUser[_user][_indexOfPromo]);
+        return (uniqPromoForUser[_user][_id][_indexOfPromo]);
     }
 
     /**
@@ -425,18 +458,21 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
 
      /**
      * @dev Finds the index of a promo code for a user.
+     * @dev It is used in the reedemPromoCode function to get the index in the user's mapping and correctly delete the promo code
+            after completing the main logic of the function.
      * @param _user The address of the user.
      * @param _promoCode The promo code to find.
-     * @return The index of the promo code and a boolean indicating if the promo code was found.
+     * @return The index of the promo code and a boolean indicating if the promo code was found.    
      */
-    function _findIndexByUserAddress(address _user, bytes8 _promoCode)
+    function _findIndexByUserAddress(address _user, bytes8 _promoCode, uint _id)
         internal
         view
         returns (uint256, bool)
     {
-        bytes8[] storage promoCodes = uniqPromoForUser[_user];
-        for (uint256 i = 0; i < promoCodes.length; i++) {
-            if (promoCodes[i] == _promoCode) {
+        require(_user != address(0), incorrectAddress());
+        require(collections[_id].collectionAddress != address(0), collectionNotFound());
+        for (uint256 i = 0; i < uniqPromoForUser[_user][_id].length; i++) {
+            if (uniqPromoForUser[_user][_id][i] == _promoCode)  {
                 return (i, true);
             }
         }
@@ -448,33 +484,25 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
      * @param _user The address of the user.
      * @param _promoCode The promo code to delete.
      */
-    function _deletePromoCode(address _user, bytes8 _promoCode) internal {
+    function _deletePromoCode(address _user, bytes8 _promoCode, uint _id) internal {
         require(_user != address(0), incorrectAddress());
-        (uint256 _index, bool status) = _findIndexByUserAddress(
+        require(collections[_id].collectionAddress != address(0), collectionNotFound());
+        (uint256 _index, bool _status) = _findIndexByUserAddress(
             _user,
-            _promoCode
+            _promoCode,
+            _id
         );
 
-        if (!status) {
+        if (!_status) {
             revert promoCodeNotFound();
         }
 
-        uniqPromoForUser[_user][_index] = uniqPromoForUser[_user][
-            uniqPromoForUser[_user].length - 1
-        ];
-        uniqPromoForUser[_user].pop();
-    }
-
-    /**
-     * @dev Generates a new promo code.
-     * @return The generated promo code.
-     */
-    function _generatePromoCode() internal returns (bytes8) {
-        bytes8 random = bytes8(
-            keccak256(abi.encode(block.timestamp, nonce, tx.origin, nonce))
-        );
-        nonce++;
-        return bytes8(random);
+        uint256 lastIndex = uniqPromoForUser[_user][_id].length - 1;
+        if (_index != lastIndex) {
+        uniqPromoForUser[_user][_id][_index] = uniqPromoForUser[_user][_id][lastIndex];
+        }
+        // Pop the last element (effectively deleting the element at _index)
+        uniqPromoForUser[_user][_id].pop();
     }
 
     /**
@@ -482,13 +510,34 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
      * @param _promoCode The promo code to check.
      * @return True if the promo code is valid, false otherwise.
      */
-    function _isPromoValid(bytes8 _promoCode) internal view returns (bool) {
-        for (uint256 i = 0; i < uniqPromoForUser[msg.sender].length; i++) {
-            if (uniqPromoForUser[msg.sender][i] == _promoCode) {
+    function _isPromoValid(bytes8 _promoCode, uint _id) internal view returns (bool) {
+        require(collections[_id].collectionAddress != address(0), collectionNotFound());
+
+        for (uint256 i = 0; i < uniqPromoForUser[msg.sender][_id].length; i++) {
+            if (uniqPromoForUser[msg.sender][_id][i] == _promoCode) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * @dev Generates unique promo codes for a user and saves them.
+     * @param _amount The number of promo codes to create (must be greater than 0).
+     * @param _user The address of the user receiving the promo codes (must not be the zero address).
+     * @notice Uses a combination of block data, transaction data, and a unique counter (nonce) to create each promo code. 
+     *         The generated promo codes are stored in the `uniqPromoForUser` mapping.
+     */
+    function _generatePromoCode(uint _amount, address _user, uint _id) public {
+        require(_user != address(0),incorrectAddress());
+        require(_amount > 0, incorrectQuantity());
+        
+        for (uint i = 0; i < _amount ; i++) {
+        bytes8 random = bytes8(
+            keccak256(abi.encode((blockhash(block.number - i)),block.timestamp,msg.sender, i, tx.origin,
+            block.prevrandao )));
+            uniqPromoForUser[_user][_id].push(random);
+        }
     }
 
     /**
@@ -509,4 +558,3 @@ contract MainContract is Ownable, Errors, ReentrancyGuard {
         collections[_id].quantityInStock = _newQuantity;
     }
 }
-// йцувайцацуацу
